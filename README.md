@@ -10,3 +10,4 @@ A simple cli to manage versions of ops tools. It works by downloading the binari
 ## TODO
 - [ ] Support other platforms/architectures
 - [ ] List available versions
+- [ ] Add other build targets with static linking
