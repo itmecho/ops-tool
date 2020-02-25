@@ -1,124 +1,61 @@
 mod error;
+mod tool;
 
-use std::fs::Permissions;
-use std::os::unix::fs::PermissionsExt;
+use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::PathBuf};
 
-use dirs;
-use reqwest;
+use clap::{App, Arg, SubCommand};
 use semver::Version;
-use structopt::StructOpt;
-use zip;
 
 type OpsResult<T> = Result<T, error::Error>;
 
-#[derive(StructOpt, Debug)]
-struct Cli {
-    #[structopt(subcommand)]
-    cmd: Command,
-}
+fn main() -> OpsResult<()> {
+    let matches = App::new("Ops Tool")
+        .version(clap::crate_version!())
+        .author(clap::crate_authors!())
+        .about("CLI for managing operational tools")
+        .subcommand(
+            SubCommand::with_name("use")
+                .about("Use a specific version of a tool")
+                .arg(
+                    Arg::with_name("force")
+                        .short("f")
+                        .long("force")
+                        .help("Redownload the binary if it already exists"),
+                )
+                .arg(
+                    Arg::with_name("TOOL")
+                        .help("The tool to manage")
+                        .index(1)
+                        .required(true)
+                        .possible_values(&["kops", "kubectl", "terraform"]),
+                )
+                .arg(
+                    Arg::with_name("VERSION")
+                        .help("The version to use")
+                        .index(2)
+                        .required(true),
+                ),
+        )
+        .subcommand(SubCommand::with_name("status").about("Print the current version of each tool"))
+        .get_matches();
 
-#[derive(StructOpt, Debug)]
-enum Command {
-    Use {
-        /// Download binary regardless of if it already exists
-        #[structopt(short, long)]
-        force: bool,
+    if let Some(ref matches) = matches.subcommand_matches("use") {
+        let tool = tool::Tool::from(matches.value_of("TOOL").unwrap())?;
+        let version = Version::parse(matches.value_of("VERSION").unwrap())?;
+        let force = matches.is_present("force");
 
-        #[structopt(subcommand)]
-        tool: Tool,
-    },
-}
-
-#[derive(StructOpt, Debug)]
-enum Tool {
-    Kops {
-        #[structopt(name = "VERSION")]
-        version: String,
-    },
-    Terraform {
-        #[structopt(name = "VERSION")]
-        version: String,
-    },
-}
-
-impl Tool {
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Kops { .. } => "kops",
-            Self::Terraform { .. } => "terraform",
-        }
+        use_tool(tool, &version, force)?
     }
 
-    pub fn bin_path(&self, v: &Version) -> OpsResult<std::path::PathBuf> {
-        let mut path = get_home_dir()?;
-
-        path.push("bin");
-        path.push(format!("{}-versions", self.name()));
-        path.push(format!("{}-{}", self.name(), v));
-        Ok(path)
+    if let Some(_) = matches.subcommand_matches("status") {
+        status()?
     }
-
-    pub fn link_path(&self) -> OpsResult<std::path::PathBuf> {
-        let mut path = get_home_dir()?;
-
-        path.push("bin");
-        path.push(self.name());
-        Ok(path)
-    }
-
-    pub fn download(&self, v: &Version, out: &mut impl std::io::Write) -> OpsResult<()> {
-        match self {
-            Self::Kops { .. } => {
-                let url = format!(
-                    "https://github.com/kubernetes/kops/releases/download/{}{}/kops-linux-amd64",
-                    // Kops changed it's version naming after 1.15.0, thanks for that
-                    if v > &Version::parse("1.15.0").unwrap() {
-                        "v"
-                    } else {
-                        ""
-                    },
-                    v,
-                );
-
-                let mut resp = download_file(url.as_ref())?;
-
-                std::io::copy(&mut resp, out)?;
-            }
-            Self::Terraform { .. } => {
-                let url =
-                    format!(
-                    "https://releases.hashicorp.com/terraform/{version}/terraform_{version}_linux_amd64.zip",
-                    version = v,
-                );
-
-                let mut resp = download_file(url.as_ref())?;
-
-                let a = zip::read::read_zipfile_from_stream(&mut resp)?;
-                let mut f = a.unwrap();
-
-                std::io::copy(&mut f, out)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-fn main() -> Result<(), error::Error> {
-    let cli = Cli::from_args();
-    let cmd = cli.cmd;
-
-    match cmd {
-        Command::Use { force, ref tool } => match tool {
-            Tool::Kops { ref version } => use_tool(tool, &Version::parse(version)?, force)?,
-            Tool::Terraform { ref version } => use_tool(tool, &Version::parse(version)?, force)?,
-        },
-    };
 
     Ok(())
 }
 
-fn use_tool(t: &Tool, v: &Version, force: bool) -> OpsResult<()> {
-    let bin_path = t.bin_path(v)?;
+fn use_tool<T: tool::Named + tool::Download>(t: T, v: &Version, force: bool) -> OpsResult<()> {
+    let bin_path = bin_path(t.name(), v)?;
     if !bin_path.exists() || force {
         println!(
             "Downloading {} version {} to {}",
@@ -134,7 +71,7 @@ fn use_tool(t: &Tool, v: &Version, force: bool) -> OpsResult<()> {
         t.download(v, &mut f)?;
     }
 
-    let link_path = t.link_path()?;
+    let link_path = link_path(t.name())?;
     println!("Setting permissions for {}", bin_path.to_string_lossy());
     std::fs::set_permissions(&bin_path, Permissions::from_mode(0o700))?;
     if let Ok(_) = link_path.symlink_metadata() {
@@ -156,18 +93,38 @@ fn use_tool(t: &Tool, v: &Version, force: bool) -> OpsResult<()> {
     Ok(())
 }
 
-fn get_home_dir() -> OpsResult<std::path::PathBuf> {
+fn status() -> OpsResult<()> {
+    print_version(tool::Tool::Kops)?;
+    print_version(tool::Tool::Kubectl)?;
+    print_version(tool::Tool::Terraform)?;
+    Ok(())
+}
+
+fn print_version(t: impl tool::Named) -> OpsResult<()> {
+    let p = link_path(t.name())?;
+    let p = std::fs::read_link(p)?;
+    println!("{}", p.file_name().unwrap().to_str().unwrap());
+    Ok(())
+}
+
+fn get_home_dir() -> OpsResult<PathBuf> {
     match dirs::home_dir() {
         Some(d) => Ok(d),
         None => return Err(error::Error::HomeDir),
     }
 }
 
-fn download_file(src: &str) -> OpsResult<reqwest::blocking::Response> {
-    let resp = reqwest::blocking::get(src)?;
-    if !resp.status().is_success() {
-        return Err(error::Error::Http(resp.status()));
-    };
+fn link_path(name: &str) -> OpsResult<PathBuf> {
+    let mut path = get_home_dir()?;
+    path.push("bin");
+    path.push(name);
+    Ok(path)
+}
 
-    Ok(resp)
+fn bin_path(name: &str, v: &Version) -> OpsResult<PathBuf> {
+    let mut path = get_home_dir()?;
+    path.push("bin");
+    path.push(format!("{}-versions", name));
+    path.push(format!("{}-{}", name, v));
+    Ok(path)
 }
