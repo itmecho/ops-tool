@@ -8,5 +8,5 @@ A simple cli to manage versions of ops tools. It works by downloading the binari
 * [Terraform](https://github.com/hashicorp/terraform)
 
 ## TODO
-[ ] Support other platforms/architectures
-[ ] List available versions
+- [ ] Support other platforms/architectures
+- [ ] List available versions
