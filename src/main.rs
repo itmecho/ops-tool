@@ -56,6 +56,12 @@ fn main() -> OpsResult<()> {
 
 fn use_tool<T: tool::Named + tool::Download>(t: T, v: &Version, force: bool) -> OpsResult<()> {
     let bin_path = bin_path(t.name(), v)?;
+    let mut bin_dir = bin_path.clone();
+    bin_dir.pop();
+    if !bin_dir.exists() {
+        std::fs::create_dir_all(bin_dir)?;
+    }
+
     if !bin_path.exists() || force {
         println!(
             "Downloading {} version {} to {}",
