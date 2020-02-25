@@ -3,13 +3,14 @@ mod tool;
 
 use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::PathBuf};
 
-use clap::{App, Arg, SubCommand};
+use clap::{App, AppSettings, Arg, SubCommand};
 use semver::Version;
 
 type OpsResult<T> = Result<T, error::Error>;
 
 fn main() -> OpsResult<()> {
     let matches = App::new("Ops Tool")
+        .setting(AppSettings::SubcommandRequiredElseHelp)
         .version(clap::crate_version!())
         .author(clap::crate_authors!())
         .about("CLI for managing operational tools")
@@ -56,6 +57,7 @@ fn main() -> OpsResult<()> {
 
 fn use_tool<T: tool::Named + tool::Download>(t: T, v: &Version, force: bool) -> OpsResult<()> {
     let bin_path = bin_path(t.name(), v)?;
+
     let mut bin_dir = bin_path.clone();
     bin_dir.pop();
     if !bin_dir.exists() {

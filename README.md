@@ -6,3 +6,7 @@ A simple cli to manage versions of ops tools. It works by downloading the binari
 * [Kops](https://github.com/kubernetes/kops)
 * [Kubectl](https://github.com/kubernetes/kubernetes)
 * [Terraform](https://github.com/hashicorp/terraform)
+
+## TODO
+[ ] Support other platforms/architectures
+[ ] List available versions
