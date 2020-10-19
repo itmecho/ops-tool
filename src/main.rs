@@ -1,138 +1,198 @@
-mod error;
+mod cli;
 mod tool;
 
-use std::{fs::Permissions, os::unix::fs::PermissionsExt, path::PathBuf};
+use cli::{Cli, Command};
+use tool::Tool;
 
-use clap::{App, AppSettings, Arg, SubCommand};
-use semver::Version;
+use std::{
+    fs::Permissions,
+    io::{Read, Write},
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+};
 
-type OpsResult<T> = Result<T, error::Error>;
+use anyhow::{anyhow, Result};
+use indicatif::{ProgressBar, ProgressStyle};
+use reqwest::{blocking::ClientBuilder, redirect::Policy, StatusCode};
+use structopt::StructOpt;
 
-fn main() -> OpsResult<()> {
-    let matches = App::new("Ops Tool")
-        .setting(AppSettings::SubcommandRequiredElseHelp)
-        .version(clap::crate_version!())
-        .author(clap::crate_authors!())
-        .about("CLI for managing operational tools")
-        .subcommand(
-            SubCommand::with_name("use")
-                .about("Use a specific version of a tool")
-                .arg(
-                    Arg::with_name("force")
-                        .short("f")
-                        .long("force")
-                        .help("Redownload the binary if it already exists"),
-                )
-                .arg(
-                    Arg::with_name("TOOL")
-                        .help("The tool to manage")
-                        .index(1)
-                        .required(true)
-                        .possible_values(&["kops", "kubectl", "terraform"]),
-                )
-                .arg(
-                    Arg::with_name("VERSION")
-                        .help("The version to use")
-                        .index(2)
-                        .required(true),
-                ),
-        )
-        .subcommand(SubCommand::with_name("status").about("Print the current version of each tool"))
-        .get_matches();
+fn main() -> Result<()> {
+    let cli = Cli::from_args();
 
-    if let Some(ref matches) = matches.subcommand_matches("use") {
-        let tool = tool::Tool::from(matches.value_of("TOOL").unwrap())?;
-        let version = Version::parse(matches.value_of("VERSION").unwrap())?;
-        let force = matches.is_present("force");
-
-        use_tool(tool, &version, force)?
+    match cli.command {
+        Command::Status { tool } => status(tool),
+        Command::Use {
+            force,
+            tool,
+            version,
+        } => switch_or_download(tool, &version, force),
     }
+}
 
-    if let Some(_) = matches.subcommand_matches("status") {
-        status()?
+fn status(_tool: Option<String>) -> Result<()> {
+    let tools = vec![
+        Tool::Kops.name(),
+        Tool::Kubectl.name(),
+        Tool::Terraform.name(),
+    ];
+
+    for tool in tools {
+        let link_path = get_link_path(tool);
+        if link_path.exists() {
+            // look up bin and extract version
+            let link_meta = std::fs::read_link(link_path)?;
+            let filename = link_meta.file_name().unwrap().to_str().unwrap();
+            let parts = filename.rsplitn(2, "-").collect::<Vec<&str>>();
+            println!("{}: {}", parts[1], parts[0]);
+        } else {
+            println!("{}: not setup", tool);
+        }
     }
-
     Ok(())
 }
 
-fn use_tool<T: tool::Named + tool::Download>(t: T, v: &Version, force: bool) -> OpsResult<()> {
-    let bin_path = bin_path(t.name(), v)?;
-
-    let mut bin_dir = bin_path.clone();
-    bin_dir.pop();
-    if !bin_dir.exists() {
-        std::fs::create_dir_all(bin_dir)?;
+fn switch_or_download(tool: Tool, version: &str, force: bool) -> Result<()> {
+    let versions_dir = get_versions_dir(tool.name());
+    if !versions_dir.exists() {
+        std::fs::create_dir_all(versions_dir)?;
     }
 
+    let bin_path = get_bin_path(tool.name(), version);
     if !bin_path.exists() || force {
-        println!(
-            "Downloading {} version {} to {}",
-            t.name(),
-            v,
-            bin_path.to_string_lossy()
-        );
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .open(&bin_path)?;
+        if bin_path.exists() {
+            println!("Redownloading {} {}", tool.name(), version);
+        } else {
+            println!("{} {} not found locally", tool.name(), version);
+        }
+        let (mut res, total_size, content_type) =
+            download(tool.url(version, get_os(), get_arch()).as_ref())?;
 
-        t.download(v, &mut f)?;
+        let (res, total_size): (Box<dyn Read>, u64) = match content_type.as_str() {
+            "application/zip" => {
+                let zipfile = zip::read::read_zipfile_from_stream(&mut res)?.unwrap();
+                let total_size = zipfile.size();
+                (Box::new(zipfile), total_size)
+            }
+            _ => (Box::new(res), total_size),
+        };
+
+        write_to_file(res, get_bin_path(tool.name(), version), total_size)?;
+    } else {
+        println!("Binary already downloaded. To redownload it, pass the --force flag or manually remove the file");
     }
 
-    let link_path = link_path(t.name())?;
-    println!("Setting permissions for {}", bin_path.to_string_lossy());
     std::fs::set_permissions(&bin_path, Permissions::from_mode(0o700))?;
-    if let Ok(_) = link_path.symlink_metadata() {
-        println!(
-            "Removing previous link path {}",
-            link_path.to_string_lossy()
-        );
-        std::fs::remove_file(&link_path)?;
-    }
 
-    println!(
-        "Linking {} to {}",
-        bin_path.to_string_lossy(),
-        link_path.to_string_lossy()
-    );
-    std::os::unix::fs::symlink(bin_path, link_path)?;
+    link_binary(bin_path, get_link_path(tool.name()))?;
 
     println!("Done!");
     Ok(())
 }
 
-fn status() -> OpsResult<()> {
-    print_version(tool::Tool::Kops)?;
-    print_version(tool::Tool::Kubectl)?;
-    print_version(tool::Tool::Terraform)?;
-    Ok(())
-}
-
-fn print_version(t: impl tool::Named) -> OpsResult<()> {
-    let p = link_path(t.name())?;
-    let p = std::fs::read_link(p)?;
-    println!("{}", p.file_name().unwrap().to_str().unwrap());
-    Ok(())
-}
-
-fn get_home_dir() -> OpsResult<PathBuf> {
-    match dirs::home_dir() {
-        Some(d) => Ok(d),
-        None => return Err(error::Error::HomeDir),
+fn get_os() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        os => os,
     }
 }
 
-fn link_path(name: &str) -> OpsResult<PathBuf> {
-    let mut path = get_home_dir()?;
-    path.push("bin");
-    path.push(name);
-    Ok(path)
+fn get_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86" => "i386",
+        "x86_64" => "amd64",
+        arch => arch,
+    }
 }
 
-fn bin_path(name: &str, v: &Version) -> OpsResult<PathBuf> {
-    let mut path = get_home_dir()?;
-    path.push("bin");
-    path.push(format!("{}-versions", name));
-    path.push(format!("{}-{}", name, v));
-    Ok(path)
+fn get_bin_path(tool: &str, version: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    path.push(dirs::executable_dir().unwrap());
+    path.push(format!("{}-versions", tool));
+    path.push(format!("{}-{}", tool, version));
+    path
+}
+
+fn get_link_path(tool: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    path.push(dirs::executable_dir().unwrap());
+    path.push(tool);
+    path
+}
+
+fn get_versions_dir(tool: &str) -> PathBuf {
+    let mut path = PathBuf::new();
+    path.push(dirs::executable_dir().unwrap());
+    path.push(format!("{}-versions", tool));
+    path
+}
+
+fn link_binary<P: AsRef<Path>>(bin_path: P, link_path: P) -> Result<()> {
+    println!("Updating symlink");
+    if link_path.as_ref().exists() {
+        std::fs::remove_file(link_path.as_ref())?;
+    }
+
+    Ok(std::os::unix::fs::symlink(bin_path, link_path)?)
+}
+
+fn download(url: &str) -> Result<(impl std::io::Read, u64, String)> {
+    let policy = Policy::custom(|attempt| attempt.follow());
+    let client = ClientBuilder::new().redirect(policy).build()?;
+
+    let res = client.get(url).send().map_err(|e| anyhow!(e))?;
+
+    match res.status() {
+        StatusCode::OK => {}
+        StatusCode::NOT_FOUND => return Err(anyhow!("Tool version not available for download")),
+        s => {
+            return Err(anyhow!(
+                "Recieved a non-200 response when downloading the tool: {}",
+                s
+            ))
+        }
+    }
+
+    let total_size: u64 = match res.headers().get("Content-Length") {
+        Some(length) => length.to_str()?.parse().map_err(|_| {
+            anyhow!(
+                "Invalid Content-Length header: {}",
+                length.to_str().unwrap()
+            )
+        })?,
+        None => return Err(anyhow!("No Content-Length header")),
+    };
+
+    let content_type = match res.headers().get("Content-Type") {
+        Some(value) => value.to_str()?.to_string(),
+        None => return Err(anyhow!("No Content-Type header")),
+    };
+
+    Ok((res, total_size, content_type))
+}
+
+fn write_to_file(mut src: impl Read, path: impl AsRef<Path>, total_size: u64) -> Result<()> {
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("Downloading [{bar:40.cyan/blue} {percent}%] {bytes_per_sec}")
+            .progress_chars("=>-"),
+    );
+
+    let mut dest = std::fs::File::create(path.as_ref())?;
+
+    let mut buf = [0u8; 8096];
+
+    loop {
+        let n = src.read(buf.as_mut())?;
+        if n == 0 {
+            break;
+        }
+
+        dest.write_all(&buf[..n])?;
+        pb.inc(n as u64);
+    }
+
+    pb.finish_with_message("Done");
+
+    Ok(())
 }
