@@ -1,4 +1,6 @@
 use anyhow::{anyhow, Result};
+use reqwest::Error;
+use serde::Deserialize;
 use url::Url;
 
 pub const TOOL_NAMES: &[&str] = &[
@@ -57,5 +59,31 @@ impl Tool {
                     arch = arch
                 )).unwrap()
         }
+    }
+
+    pub fn get_latest(&self) -> Result<String, Error> {
+        #[derive(Deserialize)]
+        struct GithubResponse {
+            tag_name: String,
+        }
+
+        let client = reqwest::blocking::Client::new();
+
+        let repo = match self {
+            Self::Terraform => "hashicorp/terraform",
+            Self::Kops => "kubernetes/kops",
+            Self::Kubectl => "kubernetes/kubernetes",
+        };
+
+        let res: GithubResponse = client
+            .get(&format!(
+                "https://api.github.com/repos/{}/releases/latest",
+                repo
+            ))
+            .header(reqwest::header::USER_AGENT, "ops-tool")
+            .send()?
+            .json()?;
+
+        Ok(res.tag_name.trim_start_matches("v").to_string())
     }
 }
